@@ -9,6 +9,7 @@ Milestone 1 scope: self-attention only (q, k, v share one shape), no GQA,
 no padding mask, no dropout, no KV cache.
 """
 
+import functools
 import math
 
 import torch
@@ -77,6 +78,60 @@ def reference_attention(
     return weights @ v
 
 
+def _online_step(q_rows, k_b, v_b, m, l, acc, causal: bool):
+    """Fold one key block into the running (m, l, acc) of the query rows in q_rows.
+
+    Shapes: q_rows [B, H, R, D], k_b/v_b [B, H, n, D], m/l [B, H, R, 1], acc [B, H, R, D].
+    Causal callers pass rows starting at the block's first key, so only the top-left
+    [n, n] tile straddles the diagonal; every lower row may see the whole block.
+    Returns the updated (m, l, acc). A separate function so torch.compile can fuse its
+    ops and reuse the result for every block.
+    """
+    s = (q_rows @ k_b.transpose(-2, -1)) / math.sqrt(q_rows.size(-1))  # [B, H, R, n]
+    if causal:
+        n = k_b.size(-2)
+        future = torch.ones(n, n, dtype=torch.bool, device=s.device).triu(1)  # key c > query r: blocked
+        # In-place write into the fresh tensor s: its producer (division) doesn't need s for
+        # backward, so autograd is unaffected (checked by the gradient test).
+        s[..., :n, :] = s[..., :n, :].masked_fill(future, float("-inf"))
+    m_new = torch.maximum(m, s.amax(dim=-1, keepdim=True))
+    alpha = torch.exp(m - m_new)  # rescale factor for the old sums (0 on a row's first block)
+    p = torch.exp(s - m_new)  # this block's unnormalised weights, each <= 1
+    return m_new, alpha * l + p.sum(dim=-1, keepdim=True), alpha * acc + p @ v_b
+
+
+def _tiled(q, k, v, causal, block_size, step):
+    validate_qkv(q, k, v)
+    if not isinstance(block_size, int) or block_size < 1:
+        raise ValueError(f"block_size must be a positive int, got {block_size!r}")
+    seq_len = q.size(-2)
+
+    m = torch.full((*q.shape[:-1], 1), float("-inf"), dtype=q.dtype, device=q.device)
+    l = torch.zeros_like(m)
+    acc = torch.zeros_like(q)
+    if not causal:
+        for start in range(0, seq_len, block_size):
+            m, l, acc = step(q, k[..., start : start + block_size, :], v[..., start : start + block_size, :],
+                             m, l, acc, False)  # fmt: skip
+        return acc / l
+
+    # Causal: the running state covers rows start..L-1 only. Rows before `start` can't see
+    # this block or any later one, so they are already final: after each block the first n
+    # rows have seen their last key, get emitted, and are dropped (slicing = views, no copy).
+    # That skips the triangle above the diagonal: about half the noncausal work. Every row
+    # still in the state sees key `start`, so no row is all -inf and m stays finite: never
+    # exp(-inf - -inf) = NaN.
+    out = []
+    for start in range(0, seq_len, block_size):
+        k_b = k[..., start : start + block_size, :]  # [B, H, n, D]; the last block may be shorter
+        v_b = v[..., start : start + block_size, :]
+        n = k_b.size(-2)
+        m, l, acc = step(q[..., start:, :], k_b, v_b, m, l, acc, True)
+        out.append(acc[..., :n, :] / l[..., :n, :])
+        m, l, acc = m[..., n:, :], l[..., n:, :], acc[..., n:, :]
+    return torch.cat(out, dim=-2)
+
+
 def tiled_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, block_size: int = 64
 ) -> torch.Tensor:
@@ -90,40 +145,32 @@ def tiled_attention(
     When a block raises the max, the old l and acc are rescaled by
     exp(m_old - m_new), which rewrites them relative to the new max.
     At the end acc / l == softmax(scores) @ v exactly, up to float rounding.
+    Causal calls skip query rows that can't see a block (about half the work).
 
     Inference-oriented: under autograd every block's weights are saved for
     backward, so training memory is O(L^2) again. FlashAttention avoids that by
     recomputing blocks in backward.
     """
-    validate_qkv(q, k, v)
-    if not isinstance(block_size, int) or block_size < 1:
-        raise ValueError(f"block_size must be a positive int, got {block_size!r}")
-    seq_len, d = q.size(-2), q.size(-1)
+    return _tiled(q, k, v, causal, block_size, _online_step)
 
-    m = torch.full((*q.shape[:-1], 1), float("-inf"), dtype=q.dtype, device=q.device)
-    l = torch.zeros_like(m)
-    acc = torch.zeros_like(q)
-    query_pos = torch.arange(seq_len, device=q.device).unsqueeze(-1)  # [L, 1]
 
-    # ponytail: tiles keys only, all queries at once. Tiling queries too would let causal
-    # skip blocks above the diagonal (about half the work); add if causal speed matters.
-    for start in range(0, seq_len, block_size):
-        k_b = k[..., start : start + block_size, :]  # [B, H, bs, D]; the last block may be shorter
-        v_b = v[..., start : start + block_size, :]
-        s = (q @ k_b.transpose(-2, -1)) / math.sqrt(d)  # [B, H, L, bs]
-        if causal:
-            key_pos = torch.arange(start, start + k_b.size(-2), device=q.device)  # [bs]
-            # [L, bs] mask, True = future key = blocked. Blocks go in order from key 0 and
-            # every row may see key 0, so m is finite after the first block: a later
-            # all-masked block gives exp(-inf - m) = 0, never exp(-inf - -inf) = NaN.
-            s = s.masked_fill(key_pos > query_pos, float("-inf"))
-        m_new = torch.maximum(m, s.amax(dim=-1, keepdim=True))
-        alpha = torch.exp(m - m_new)  # rescale factor for the old sums (0 on the first block)
-        p = torch.exp(s - m_new)  # this block's unnormalised weights, each <= 1
-        l = alpha * l + p.sum(dim=-1, keepdim=True)
-        acc = alpha * acc + p @ v_b
-        m = m_new
-    return acc / l
+@functools.cache
+def _compiled_step():
+    # Default "automatic dynamic": the first call compiles for static shapes; a shape change
+    # (causal blocks shrink in rows) recompiles once with dynamic shapes. Measured at L=4096
+    # noncausal on CPU: static 19.8 ms, forced dynamic=True 23.2 ms, eager 22.0 ms.
+    # Compiling the whole loop instead unrolls it; at L=1024 that ran > 10 minutes.
+    return torch.compile(_online_step)
+
+
+def tiled_attention_compiled(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, block_size: int = 64
+) -> torch.Tensor:
+    """tiled_attention with each block's step fused by torch.compile (Inductor).
+
+    The first call compiles (seconds); later calls reuse the kernel. Needs a C++ compiler on CPU.
+    """
+    return _tiled(q, k, v, causal, block_size, _compiled_step())
 
 
 def sdpa_attention(

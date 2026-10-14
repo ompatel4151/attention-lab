@@ -10,7 +10,6 @@ With no input files the report says so instead of showing any numbers.
 
 import argparse
 import json
-import statistics
 from collections import defaultdict
 from pathlib import Path
 
@@ -24,7 +23,6 @@ COLORS = {
     "reference": "tab:blue", "sdpa": "tab:orange", "tiled": "tab:green",
     "sdpa_math": "tab:red", "sdpa_flash": "tab:purple", "sdpa_efficient": "tab:brown",
 }  # fmt: skip
-MARKERS = {"float64": "s", "float32": "o", "float16": "^", "bfloat16": "v"}
 MIB = 2**20
 
 
@@ -72,39 +70,51 @@ def _style_axes(ax, seq_lens, ylabel, title, log_y):
     ax.set_ylabel(ylabel)
     ax.set_title(title, fontsize=9)
     ax.grid(True, which="major", alpha=0.3)
-    ax.legend(fontsize=7)
 
 
 def _plot(run, path, values, ylabel, title, force_log=False):
-    """values(method_result) -> (y, (low, high) or None). Log y when the data spans > 30x."""
-    fig, ax = plt.subplots(figsize=(7.5, 4.8))
-    ys = []
-    for (method, dtype, causal), pts in series(run).items():
-        vals = [values(m) for _, m in pts]
-        y = [v[0] for v in vals]
-        ys += y
-        yerr = None
-        if all(v[1] for v in vals):
-            yerr = [[yy - v[1][0] for yy, v in zip(y, vals)], [v[1][1] - yy for yy, v in zip(y, vals)]]
-        ax.errorbar(
-            [L for L, _ in pts], y, yerr=yerr, capsize=3, color=COLORS.get(method, "black"),
-            marker=MARKERS[dtype], linestyle="--" if causal else "-", label=f"{method}, {dtype}, {causal_name(causal)}",
-        )  # fmt: skip
-    all_L = sorted({L for pts in series(run).values() for L, _ in pts})
-    _style_axes(ax, all_L, ylabel, title, force_log or max(ys) / max(min(ys), 1e-12) > 30)
+    """values(method_result) -> (y, (low, high) or None). One panel per dtype; colour = method,
+    dashed = causal; one legend outside the panels. Log y when the data spans > 30x."""
+    data = series(run)
+    dtypes = list(dict.fromkeys(dtype for _, dtype, _ in data))
+    fig, axes = plt.subplots(len(dtypes), 1, figsize=(8.5, 3.6 * len(dtypes) + 1.0), squeeze=False)
+    for ax, dtype in zip(axes[:, 0], dtypes):
+        ys = []
+        for (method, dt, causal), pts in data.items():
+            if dt != dtype:
+                continue
+            vals = [values(m) for _, m in pts]
+            y = [v[0] for v in vals]
+            ys += y
+            yerr = None
+            if all(v[1] for v in vals):
+                yerr = [[yy - v[1][0] for yy, v in zip(y, vals)], [v[1][1] - yy for yy, v in zip(y, vals)]]
+            ax.errorbar(
+                [L for L, _ in pts], y, yerr=yerr, capsize=3, color=COLORS.get(method, "black"), marker="o",
+                markersize=4, linestyle="--" if causal else "-", label=f"{method}, {causal_name(causal)}",
+            )  # fmt: skip
+        seq_lens = sorted({L for (_, dt, _), pts in data.items() if dt == dtype for L, _ in pts})
+        log_y = force_log or max(ys) / max(min(ys), 1e-12) > 30
+        _style_axes(ax, seq_lens, ylabel, dtype, log_y)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8, frameon=False)
+    fig.suptitle(title, fontsize=10)
     fig.tight_layout()
-    fig.savefig(path, dpi=120)
+    fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
 
 def plot_latency(run: dict, path: Path) -> None:
     def values(m):
-        s = m["timing"]["samples_s"]
-        q = statistics.quantiles(s, n=4) if len(s) > 1 else [s[0]] * 3
-        return us(m["timing"]["median_s"]), (us(q[0]), us(q[2]))  # error bars: p25..p75 of raw samples
+        lo, hi = m["timing"]["median_ci95_s"]
+        return us(m["timing"]["median_s"]), (us(lo), us(hi))  # error bars: bootstrap 95% CI of the median
 
-    title = f"Attention latency (median, bars = p25-p75)\n{environment_label(run['environment'])}"
+    title = f"Attention latency (median, bars = 95% CI of the median)\n{environment_label(run['environment'])}"
     _plot(run, path, values, "latency per call (µs)", title)
+
+
+def has_memory(run: dict) -> bool:
+    return any(m["memory"] for pts in series(run).values() for _, m in pts)
 
 
 def plot_memory(run: dict, path: Path) -> None:
@@ -117,9 +127,12 @@ def plot_memory(run: dict, path: Path) -> None:
 
 
 def results_table(run: dict) -> list[str]:
-    head = "| L | dtype | mask | method | median µs (IQR) | ref / method | peak MiB | max abs err | correct | SDPA kernel observed |"
+    head = (
+        "| L | dtype | mask | method | median µs [95% CI] | ref / method [95% CI] | peak MiB | first call ms "
+        "| max abs err | correct | SDPA kernel observed |"
+    )
     lines = [head, "|" + "---|" * (head.count("|") - 1)]
-    blanks = " |" * 6
+    blanks = " |" * 7
     for r in run["results"]:
         prefix = f"| {r['seq_len']} | {r['dtype']} | {causal_name(r['causal'])} |"
         if r["status"] != "ok":
@@ -130,10 +143,13 @@ def results_table(run: dict) -> list[str]:
                 lines.append(f"{prefix} {name} | skipped: {m['skip_reason']} |{blanks}")
                 continue
             t, ratio = m["timing"], r["speedup_vs_reference"].get(name)
+            ci = r["speedup_ci95"].get(name)
+            lo, hi = t["median_ci95_s"]
+            ratio_txt = f"{ratio:.2f}x [{ci[0]:.2f}, {ci[1]:.2f}]" if ratio else "-"
+            peak_txt = f"{m['memory']['incremental_peak_bytes'] / MIB:.2f}" if m["memory"] else "n/a"
             lines.append(
-                f"{prefix} {name} | {us(t['median_s']):.1f} ({us(t['iqr_s']):.1f}) | "
-                f"{f'{ratio:.2f}x' if ratio else '-'} | {m['memory']['incremental_peak_bytes'] / MIB:.2f} | "
-                f"{m['max_abs_err']:.1e} | {'yes' if m['correct'] else '**NO**'} | "
+                f"{prefix} {name} | {us(t['median_s']):.1f} [{us(lo):.1f}, {us(hi):.1f}] | {ratio_txt} | {peak_txt} | "
+                f"{m['first_call_s'] * 1e3:.1f} | {m['max_abs_err']:.1e} | {'yes' if m['correct'] else '**NO**'} | "
                 f"{', '.join(o.removeprefix('aten::') for o in m['observed_sdpa_ops']) or '-'} |"
             )
     return lines
@@ -148,13 +164,16 @@ def observations(run: dict) -> list[str]:
     ratios = defaultdict(list)
     for r in ok:
         for name, ratio in r["speedup_vs_reference"].items():
-            ratios[(name, r["dtype"], r["causal"])].append((r["seq_len"], ratio))
+            ratios[(name, r["dtype"], r["causal"])].append((r["seq_len"], ratio, r["speedup_ci95"][name]))
     for (name, dtype, causal), pts in ratios.items():
-        faster = sum(x > 1 for _, x in pts)
+        # "Faster"/"slower" only when the whole 95% CI of the ratio is on one side of 1.
+        faster = [L for L, _, ci in pts if ci[0] > 1]
+        slower = [L for L, _, ci in pts if ci[1] < 1]
         lines.append(
-            f"- {name} vs reference, {dtype}, {causal_name(causal)}: lower median in {faster} of {len(pts)} "
-            f"configurations; reference/{name} ratio {min(x for _, x in pts):.2f}x to {max(x for _, x in pts):.2f}x "
-            f"over L = {', '.join(str(L) for L, _ in pts)}."
+            f"- {name} vs reference, {dtype}, {causal_name(causal)}: reference/{name} ratio "
+            f"{min(x for _, x, _ in pts):.2f}x to {max(x for _, x, _ in pts):.2f}x over L = "
+            f"{', '.join(str(L) for L, _, _ in pts)}. 95% CI above 1 (faster) at L = "
+            f"{', '.join(map(str, faster)) or 'none'}; below 1 (slower) at L = {', '.join(map(str, slower)) or 'none'}."
         )
     kernels = defaultdict(set)
     for r in ok:
@@ -177,9 +196,13 @@ def observations(run: dict) -> list[str]:
         if len(pts) >= 2:
             (L0, m0), (L1, m1) = pts[0], pts[-1]
             t = m1["timing"]["median_s"] / m0["timing"]["median_s"]
-            mem = m1["memory"]["incremental_peak_bytes"] / m0["memory"]["incremental_peak_bytes"]
+            mem = (
+                f"x{m1['memory']['incremental_peak_bytes'] / m0['memory']['incremental_peak_bytes']:.1f}"
+                if m0["memory"] and m1["memory"]
+                else "n/a"
+            )
             growth.append(
-                f"| {method} | {dtype} | {causal_name(causal)} | {L0} → {L1} | x{t:.1f} | x{mem:.1f} "
+                f"| {method} | {dtype} | {causal_name(causal)} | {L0} → {L1} | x{t:.1f} | {mem} "
                 f"| x{L1 / L0:g} | x{(L1 / L0) ** 2:g} |"
             )
     if growth:
@@ -218,7 +241,10 @@ How to read this:
   so latency can grow much more slowly than L².
 - The explicit causal reference builds an [L, L] mask on every call. The tiled method loops over key blocks
   in Python, so its per-block overhead is large at small L, and causal does not skip any blocks.
-- CPU peak memory comes from torch.profiler allocation events and counts only PyTorch-allocator memory."""
+- CPU peak memory comes from torch.profiler allocation events and counts only PyTorch-allocator memory.
+  MPS has no peak-memory counter, so MPS memory is n/a (not estimated).
+- Confidence intervals are percentile bootstraps over timing samples, which assumes independent samples;
+  drift and correlation make the real uncertainty larger. "First call" includes torch.compile's compile time."""
 
 
 def build_report(json_paths: list[Path], out_dir: Path) -> Path:
@@ -261,6 +287,8 @@ def build_report(json_paths: list[Path], out_dir: Path) -> Path:
         ]
         if series(run):
             for kind, plot in (("latency", plot_latency), ("memory", plot_memory)):
+                if kind == "memory" and not has_memory(run):
+                    continue
                 png = out_dir / f"{path.stem}-{kind}.png"
                 plot(run, png)
                 md += [f"![{kind} vs L]({png.name})", ""]

@@ -1,13 +1,17 @@
-"""Benchmark: result arithmetic, output schema, skips and CPU memory. Never asserts which method is faster."""
+"""Benchmark: result arithmetic, statistics, output schema, skips, memory, devices.
+
+Never asserts which method is faster.
+"""
 
 import csv
 import json
+import statistics
 
 import pytest
 import torch
 
 from attention_lab import benchmark, reference_attention, sdpa_attention, tiled_attention
-from attention_lab.benchmark import main, profile_call, speedup, summarize
+from attention_lab.benchmark import bootstrap_median_ci, bootstrap_speedup_ci, main, profile_call, speedup, summarize
 
 
 def test_speedup_is_reference_over_candidate():
@@ -20,13 +24,30 @@ def test_speedup_is_reference_over_candidate():
 def test_summarize():
     s = summarize([5.0, 1.0, 3.0, 2.0, 4.0])
     # statistics.quantiles default ("exclusive"): p25 = 1.5, p75 = 4.5 for 1..5.
-    assert s == {"median_s": 3.0, "iqr_s": 3.0, "min_s": 1.0, "max_s": 5.0, "num_samples": 5}
+    assert {k: s[k] for k in ("median_s", "iqr_s", "min_s", "max_s", "num_samples")} == {
+        "median_s": 3.0, "iqr_s": 3.0, "min_s": 1.0, "max_s": 5.0, "num_samples": 5,
+    }  # fmt: skip
+    lo, hi = s["median_ci95_s"]
+    assert 1.0 <= lo <= 3.0 <= hi <= 5.0
     assert summarize([7.0])["iqr_s"] == 0.0
+
+
+def test_bootstrap_intervals():
+    assert bootstrap_median_ci([2.0] * 20) == [2.0, 2.0]  # no spread -> zero-width interval
+    samples = [float(x) for x in range(1, 101)]
+    lo, hi = bootstrap_median_ci(samples)
+    assert lo < statistics.median(samples) < hi and hi - lo < 30
+    assert bootstrap_median_ci(samples) == bootstrap_median_ci(samples)  # seeded: reproducible
+    # Candidate = reference / 2, but the two lists are resampled independently, so the
+    # interval brackets 2 instead of collapsing onto it.
+    lo, hi = bootstrap_speedup_ci(samples, [x / 2 for x in samples])
+    assert lo < 2.0 < hi
 
 
 def test_smoke_run_schema(tmp_path):
     out = tmp_path / "run.json"
-    assert main(["--device", "cpu", "--preset", "smoke", "--warmup", "2", "--min-run-time", "0.02", "--output", str(out)]) == 0
+    args = ["--device", "cpu", "--preset", "smoke", "--warmup", "2", "--min-run-time", "0.06", "--rounds", "3"]
+    assert main([*args, "--output", str(out)]) == 0
 
     data = json.loads(out.read_text())
     env, settings, results = data["environment"], data["settings"], data["results"]
@@ -34,6 +55,7 @@ def test_smoke_run_schema(tmp_path):
         assert key in env
     assert env["device"] == "cpu"
     assert settings["methods"] == ["reference", "sdpa", "tiled"]
+    assert settings["rounds"] == 3
     assert settings["memory_method"].startswith("torch.profiler")
 
     assert [(r["seq_len"], r["causal"]) for r in results] == [(32, False), (32, True)]
@@ -42,15 +64,19 @@ def test_smoke_run_schema(tmp_path):
         assert (r["batch"], r["heads"], r["head_dim"], r["dtype"]) == (1, 2, 32, "float32")
         for name, m in r["methods"].items():
             assert m["status"] == "ok" and m["correct"]
+            assert m["first_call_s"] > 0
             t = m["timing"]
-            assert t["num_samples"] == len(t["samples_s"]) > 0
+            assert t["num_samples"] == len(t["samples_s"]) >= 3  # at least one sample per round
             assert all(x > 0 for x in t["samples_s"])
-            assert t["warmup_calls"] == 2
+            assert t["median_ci95_s"][0] <= t["median_s"] <= t["median_ci95_s"][1]
+            assert (t["warmup_calls"], t["rounds"]) == (2, 3)
             assert m["memory"]["incremental_peak_bytes"] > 0
         ref = r["methods"]["reference"]["timing"]["median_s"]
-        assert set(r["speedup_vs_reference"]) == {"sdpa", "tiled"}
+        assert set(r["speedup_vs_reference"]) == set(r["speedup_ci95"]) == {"sdpa", "tiled"}
         for name, ratio in r["speedup_vs_reference"].items():
             assert ratio == pytest.approx(ref / r["methods"][name]["timing"]["median_s"])
+            lo, hi = r["speedup_ci95"][name]
+            assert lo <= ratio <= hi
         # Only SDPA calls an SDPA kernel; the profiler sees which one.
         assert r["methods"]["sdpa"]["observed_sdpa_ops"]
         assert r["methods"]["reference"]["observed_sdpa_ops"] == r["methods"]["tiled"]["observed_sdpa_ops"] == []
@@ -66,12 +92,12 @@ def test_failing_method_is_skipped_not_fatal(tmp_path, monkeypatch):
 
     monkeypatch.setitem(benchmark.METHODS, "boom", boom)
     out = tmp_path / "run.json"
-    args = ["--methods", "reference", "boom", "--causal", "off", "--warmup", "1", "--min-run-time", "0.01"]
+    args = ["--methods", "reference", "boom", "--causal", "off", "--warmup", "1", "--min-run-time", "0.03"]
     assert main([*args, "--output", str(out)]) == 0
     (r,) = json.loads(out.read_text())["results"]
     assert r["methods"]["boom"] == {"status": "skipped", "skip_reason": "RuntimeError: No viable backend"}
     assert r["methods"]["reference"]["status"] == "ok"
-    assert r["speedup_vs_reference"] == {}
+    assert r["speedup_vs_reference"] == r["speedup_ci95"] == {}
 
 
 def test_cpu_peak_memory_scaling():
@@ -107,6 +133,21 @@ def test_profiler_sees_sdpa_kernel():
     with torch.inference_mode():
         ops, _ = profile_call(lambda: sdpa_attention(q, k, v, causal=True))
     assert any(op.startswith("aten::_scaled_dot_product") for op in ops)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Apple MPS")
+def test_mps_smoke_run(tmp_path):
+    # Exercises the event-timing path (shared with CUDA) and the CPU float64 golden.
+    out = tmp_path / "mps.json"
+    args = ["--device", "mps", "--seq-lens", "64", "--dtypes", "float32", "float16", "--event-reps", "6", "--warmup", "1"]
+    assert main([*args, "--output", str(out)]) == 0
+    data = json.loads(out.read_text())
+    assert data["environment"]["device"] == "mps"
+    assert data["settings"]["memory_method"].startswith("unavailable")
+    for r in data["results"]:
+        for m in r["methods"].values():
+            assert m["status"] == "ok" and m["correct"] and m["memory"] is None
+            assert m["timing"]["num_samples"] == 6
 
 
 @pytest.mark.skipif(torch.cuda.is_available(), reason="checks the no-CUDA error path")

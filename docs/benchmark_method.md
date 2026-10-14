@@ -13,31 +13,58 @@ These all happen **outside** the timed region:
 
 ## CPU timing
 
-1. `--warmup` untimed calls (default 10). Early calls pay one-time costs: lazy initialization,
-   thread-pool startup, allocator growth and cold caches.
-2. `torch.utils.benchmark.Timer(...).blocked_autorange(min_run_time=0.2)`. This picks a block size
+1. `--warmup` untimed calls (default 10) before the first round. Early calls pay one-time costs: lazy
+   initialization, thread-pool startup, allocator growth and cold caches.
+2. `torch.utils.benchmark.Timer(...).blocked_autorange(min_run_time=T / rounds)`. This picks a block size
    (calls per sample) so that each block is long enough for the clock to resolve, then keeps
-   measuring blocks until `min_run_time` has passed. Each sample is the mean per-call time of one block.
-3. We report median and IQR (p75 − p25) in seconds, and keep every raw sample in the JSON.
+   measuring blocks until the time is used up. Each sample is the mean per-call time of one block.
+   T is 0.3 s by default and 1.5 s for `cpu-large`.
+3. Samples from all rounds are pooled. We report the median, its bootstrap 95% CI, IQR, min and max in
+   seconds, and keep every raw sample in the JSON.
 
 Two pitfalls found in torch 2.14.1's `Timer` and handled explicitly:
 - **`num_threads` defaults to 1.** We pass the real `torch.get_num_threads()` and record it. If you
-  forget this, every CPU result is single-threaded.
+  forget this, every CPU result is single-threaded. Drill: with 1 thread, L = 32 was *faster* and
+  L = 256 much slower.
 - **The default clock calls `torch.accelerator.synchronize()` on every read** when any accelerator
   exists. On Apple Silicon that is MPS. CPU-only timing has nothing to wait for, so we pass
   `timer=timeit.default_timer`.
 
-## CUDA timing (implemented, not run)
+## Interleaved rounds
 
-CUDA kernel launches are asynchronous: `fn()` returns once the work is queued, not when it is
-finished. Wall-clock timing without a synchronize would measure how fast the CPU queues work.
-The approach:
-1. Run the warmup calls, then `torch.cuda.synchronize()` so warmup work cannot spill into sample 1.
-2. For each sample: `start.record()`, then `fn()`, then `end.record()`, then `end.synchronize()`,
+Each configuration is timed in `--rounds` rounds (default 3). Every round times every method once, and
+the starting method rotates each round. Without this, method A would always run before B, and slow
+drift (thermal throttling, a background task, cache state) would bias one method systematically.
+Interleaving spreads that drift across all methods. Separate runs of the same preset (`-run2`, `-run3`)
+then measure between-run variation on top of that.
+
+## Confidence intervals
+
+- **Median:** a 95% percentile bootstrap. Resample the samples with replacement 1000 times, take each
+  resample's median, and keep the 2.5th and 97.5th percentiles. It's seeded, so the result is reproducible.
+- **Speedup** (reference median / method median): resample both sample lists independently, take the
+  ratio each time, and report its percentiles. The report calls a method *faster* or *slower* only when
+  this whole interval lies above or below 1.
+- **Assumption and its limit:** the bootstrap treats samples as independent. Timing samples drift and
+  correlate (thermal state, caches), so these intervals describe within-run noise and understate the real
+  uncertainty. Between-run spread across `-run2`/`-run3` is the honest check, and it's often wider.
+
+## GPU timing: MPS (run) and CUDA (written, not run)
+
+GPU launches are asynchronous: `fn()` returns once the work is queued, not when it is finished.
+Wall-clock timing without a synchronize would measure how fast the CPU queues work. `time_events`
+serves both backends (`torch.mps` and `torch.cuda` have the same Event API):
+1. Run the warmup calls, then a device-wide `synchronize()`, so warmup work can't spill into sample 1.
+2. For each sample: `start.record()`, then `fn()`, then `end.record()`, then a device-wide `synchronize()`,
    then `start.elapsed_time(end)` (milliseconds, converted to seconds).
-3. Events measure GPU stream time between the two markers. If the GPU sits idle waiting for the CPU
-   to launch the next kernel, that idle time is included. This matters for the multi-kernel
-   reference at small L.
+3. Events measure GPU stream time between the two markers. If the GPU sits idle waiting for the CPU to
+   launch the next kernel, that idle time is included. This is exactly what hurts the tiled loop on MPS.
+
+**An MPS hang found and worked around.** On torch 2.14.1, `end.synchronize()` followed by
+`start.elapsed_time(end)` blocks forever on MPS, waiting inside `MPSEventPool::elapsedTime` (seen with
+macOS `sample`, and reproduced in isolation in a subprocess with a timeout). A device-wide
+`torch.mps.synchronize()` before `elapsed_time` works. The code uses the device-wide synchronize for
+CUDA too: it's correct for both, just slightly more conservative.
 
 ## Memory on CPU
 
@@ -66,6 +93,11 @@ The same profiler pass lists every aten op the call dispatched. Ops starting wit
 | sdpa_math (`sdpa_kernel([SDPBackend.MATH])`) | `aten::_scaled_dot_product_attention_math` |
 | sdpa_efficient (`EFFICIENT_ATTENTION`) | none: skipped with "No viable backend ..." |
 
+On **MPS** (same machine), automatic SDPA, forced MATH *and* forced FLASH all dispatch to
+`aten::_scaled_dot_product_attention_math_for_mps`, a dedicated MPS kernel. Forcing a backend with
+`sdpa_kernel` doesn't select a different implementation there. On MPS this "math" kernel is the fast path,
+unlike on CPU.
+
 This is an observation for these shapes and dtypes on this machine, not a rule. Forced methods also pay
 the small cost of entering the `sdpa_kernel` context on every call.
 
@@ -86,9 +118,17 @@ matrix (FlashAttention). Whether that happened in a given run has to be measured
 
 ## Correctness inside the benchmark
 
-Each method's output is compared, outside timing, against `reference_attention` on float64 copies of
-the same inputs, using the per-dtype tolerances in `benchmark.TOLERANCES`. Max |err| is recorded.
-If a check fails, the timings are kept but flagged, and the CLI exits with code 1.
+Each method's output is copied to the CPU and compared, outside timing, against `reference_attention`
+run **on the CPU in float64** on the same already-cast inputs. MPS has no float64, and computing the
+reference on the CPU keeps one reference for every device. Max |err| is recorded and checked against the
+per-dtype tolerances in `benchmark.TOLERANCES`. If a check fails, the timings are kept but flagged, and
+the CLI exits with code 1.
+
+Measured on MPS (worst over all methods, L = 256…4096): float32 2.2e-6 (tolerance 1e-5), float16 2.3e-3
+(tolerance 1e-2), bfloat16 1.8e-2 (tolerance 5e-2). That's at least 2.8× headroom. The largest errors came
+from the reference and tiled methods, whose intermediates (scores, weights) are stored in the low-precision
+dtype; SDPA's were lower (9.6e-4 / 7.6e-3), plausibly because its kernel accumulates in higher precision
+(not verified). They're still unvalidated on CUDA, where different kernels may round differently.
 
 ## Skips and errors
 
@@ -107,10 +147,12 @@ If a check fails, the timings are kept but flagged, and the CLI exits with code 
 - **SDPA's backend is chosen automatically.** The profiler records which kernel ran (see above). On CUDA, a
   CUDA tensor alone does not imply FlashAttention ran. Check `observed_sdpa_ops`.
 - **Large L needs longer measurement.** `cpu-large` calls take up to about 40 ms, so that preset uses
-  `min_run_time=1.0`. Even so, the same configuration's median varied by a median of 14% across 3 runs
-  (5–16% at L = 4096, up to 73% at L = 1024). The README reports ranges across runs for that reason.
-- **The tiled method is a Python loop.** Its latency includes about 18–21 aten op dispatches per key block.
-  That's an implementation cost, not a property of the algorithm. A fused kernel avoids it.
+  `min_run_time=1.5`. Even so, the same configuration's median varied by a median of 11% across 3 runs
+  (up to 35%). That's wider than the within-run bootstrap CIs, so the README reports ranges across runs.
+  For `cpu-sweep` the between-run spread was a median of 5%.
+- **The tiled method is a Python loop.** Its latency includes about 20 aten op dispatches per key block.
+  That's an implementation cost, not a property of the algorithm. On MPS every op is a GPU kernel launch,
+  which is why tiled is 0.24–0.39× the reference's speed there at L = 4096. A fused kernel avoids it.
 - **Noise:** other processes, thermal throttling and power mode all move results. On Apple Silicon,
   which cores run the work (performance or efficiency) can also change them. Treat ratios from one
   run as one observation.

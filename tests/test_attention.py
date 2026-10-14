@@ -18,7 +18,8 @@ difference and where it occurred.
 import pytest
 import torch
 
-from attention_lab import causal_mask, reference_attention, sdpa_attention, tiled_attention
+from attention_lab import causal_mask, reference_attention, sdpa_attention, tiled_attention, tiled_attention_compiled
+from attention_lab.attention import _online_step, _tiled
 
 FWD_TOL = dict(atol=1e-5, rtol=1e-5)
 GRAD_TOL = dict(atol=5e-5, rtol=1e-4)
@@ -149,3 +150,30 @@ def test_tiled_rejects_bad_block_size(block_size):
     q, k, v = make_qkv((1, 1, 4, 8))
     with pytest.raises(ValueError):
         tiled_attention(q, k, v, block_size=block_size)
+
+
+def test_tiled_causal_skips_rows_above_the_diagonal():
+    # L=10, block 4: key blocks start at 0, 4, 8. Causal only feeds rows start..L-1 to each
+    # block (rows before `start` can't see it), so the step sees 10, 6, then 2 rows.
+    # Noncausal feeds all 10 rows every time. Total causal work: 18/30 of noncausal here,
+    # tending to 1/2 as L grows.
+    seen = {}
+    for causal in (False, True):
+        rows = seen[causal] = []
+
+        def counting_step(q_rows, *rest):
+            rows.append(q_rows.size(-2))
+            return _online_step(q_rows, *rest)
+
+        q, k, v = make_qkv((1, 2, 10, 4))
+        out = _tiled(q, k, v, causal, 4, counting_step)
+        torch.testing.assert_close(out, reference_attention(q, k, v, causal=causal), **FWD_TOL)
+    assert seen == {False: [10, 10, 10], True: [10, 6, 2]}
+
+
+def test_compiled_tiled_matches_reference():
+    # First call compiles with torch.compile (a few seconds); needs a C++ compiler on CPU.
+    q, k, v = make_qkv((1, 2, 64, 16))
+    for causal in (False, True):
+        out = tiled_attention_compiled(q, k, v, causal=causal, block_size=16)
+        torch.testing.assert_close(out, reference_attention(q, k, v, causal=causal), **FWD_TOL)

@@ -1,5 +1,8 @@
 """Milestone 3: the report is built only from real saved runs."""
 
+import pytest
+import torch
+
 from attention_lab import benchmark, report
 
 
@@ -25,3 +28,14 @@ def test_report_from_real_smoke_run(tmp_path):
     assert "python -m attention_lab.benchmark --preset smoke" in text
     for kind in ("latency", "memory"):
         assert (tmp_path / "rep" / f"smoke-{kind}.png").stat().st_size > 0
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Apple MPS")
+def test_report_from_real_mps_run_has_no_memory_numbers(tmp_path):
+    run = tmp_path / "mps.json"
+    benchmark.main(["--device", "mps", "--seq-lens", "64", "--event-reps", "3", "--warmup", "1", "--output", str(run)])
+    report.main([str(run), "--out-dir", str(tmp_path / "rep")])
+    text = (tmp_path / "rep" / "report.md").read_text()
+    assert "| n/a |" in text  # MPS memory is reported as unavailable, never estimated
+    assert (tmp_path / "rep" / "mps-latency.png").exists()
+    assert not (tmp_path / "rep" / "mps-memory.png").exists()

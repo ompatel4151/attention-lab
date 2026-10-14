@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "attention-lab"
+version = "0.1.0"
+description = "Small, reproducible attention correctness and inference benchmark."
+requires-python = ">=3.10"
+# Tested only with: Python 3.12.13, torch 2.14.1 (CPU wheel), pytest 9.1.1,
+# matplotlib 3.11.2 on macOS 27.0.1 / Apple M4. The lower bounds below are
+# where the APIs we use exist, but they are not tested.
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "matplotlib>=3.8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

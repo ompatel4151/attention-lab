@@ -1,13 +1,14 @@
-"""Inference-only latency benchmark: reference_attention vs sdpa_attention.
+"""Inference-only benchmark of attention implementations on synthetic tensors.
 
     python -m attention_lab.benchmark --device cpu --preset smoke --output results/run.json
 
-This times one attention call on synthetic [B, H, L, D] tensors. It says nothing
-about whole-model (LLM) performance.
+Methods: the explicit reference, PyTorch SDPA (automatic backend), our tiled
+online-softmax attention, and SDPA forced to one backend with sdpa_kernel.
+This times one attention call; it says nothing about whole-model (LLM) performance.
 
-Timing boundary: only the call `method(q, k, v, causal=...)`, which includes the
-same Python validation in both wrappers. Input generation, host->device copies,
-correctness checks, memory probes and file I/O all happen outside it.
+Timing boundary: only the call `method(q, k, v, causal=...)`. Input generation,
+host->device copies, correctness checks, profiling, memory probes and file I/O
+all happen outside it.
 """
 
 import argparse
@@ -22,24 +23,47 @@ from functools import partial
 from pathlib import Path
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.profiler import ProfilerActivity, profile
 from torch.utils.benchmark import Timer
 
-from .attention import reference_attention, sdpa_attention
+from .attention import reference_attention, sdpa_attention, tiled_attention
 
-METHODS = {"reference": reference_attention, "sdpa": sdpa_attention}
+
+def _forced(backend: SDPBackend):
+    """sdpa_attention restricted to one backend; raises RuntimeError if it can't run the input."""
+
+    def fn(q, k, v, causal=False):
+        with sdpa_kernel([backend]):
+            return sdpa_attention(q, k, v, causal=causal)
+
+    return fn
+
+
+METHODS = {
+    "reference": reference_attention,
+    "sdpa": sdpa_attention,
+    "tiled": tiled_attention,
+    "sdpa_math": _forced(SDPBackend.MATH),
+    "sdpa_flash": _forced(SDPBackend.FLASH_ATTENTION),
+    "sdpa_efficient": _forced(SDPBackend.EFFICIENT_ATTENTION),
+}
+DEFAULT_METHODS = ["reference", "sdpa", "tiled"]
 
 PRESETS = {
     "smoke": dict(batch=1, heads=2, seq_lens=[32], head_dim=32, dtypes=["float32"]),
     "cpu-sweep": dict(batch=1, heads=2, seq_lens=[32, 64, 128, 256], head_dim=32, dtypes=["float32"]),
+    # Large L leaves the overhead-dominated regime; calls take up to ~0.1 s, so measure longer.
+    "cpu-large": dict(batch=1, heads=2, seq_lens=[512, 1024, 2048, 4096], head_dim=32, dtypes=["float32"],
+                      min_run_time=1.0),
     "cuda-sweep": dict(
         batch=1, heads=4, seq_lens=[128, 256, 512, 1024], head_dim=64, dtypes=["float32", "float16", "bfloat16"]
     ),
-}
+}  # fmt: skip
 
-# Allowed error of each method vs. "golden" = reference_attention on the same
-# inputs upcast to float64. float32: Milestone 1 measured <= ~2e-6.
-# float16 (eps 9.8e-4) and bfloat16 (eps 7.8e-3) bounds are starting guesses,
-# NOT yet validated on a GPU; check the recorded max_abs_err before trusting them.
+# Allowed error of each method vs. "golden" = reference_attention on the same inputs
+# upcast to float64. float32: measured <= ~2e-6 on CPU. float16 (eps 9.8e-4) and
+# bfloat16 (eps 7.8e-3) bounds are starting guesses, NOT yet validated on a GPU.
 TOLERANCES = {
     "float64": dict(atol=1e-10, rtol=1e-10),
     "float32": dict(atol=1e-5, rtol=1e-5),
@@ -50,8 +74,7 @@ TOLERANCES = {
 CSV_FIELDS = [
     "device", "dtype", "batch", "heads", "seq_len", "head_dim", "causal", "method", "status", "skip_reason",
     "median_s", "iqr_s", "min_s", "max_s", "num_samples", "calls_per_sample", "warmup_calls",
-    "max_abs_err", "correct", "speedup_reference_over_sdpa",
-    "baseline_allocated_bytes", "peak_allocated_bytes", "incremental_peak_bytes",
+    "max_abs_err", "correct", "speedup_vs_reference", "incremental_peak_bytes", "observed_sdpa_ops",
 ]  # fmt: skip
 
 
@@ -110,8 +133,8 @@ def peak_memory_cuda(fn) -> dict:
     """Allocated (not reserved) bytes for one call. NOT run on the author's machine.
 
     baseline = tensors already alive (q, k, v, ...). incremental = extra memory the
-    call needed at its peak (scores, weights, output). The caching allocator usually
-    *reserves* more than is allocated; that is torch.cuda.memory_reserved, not reported.
+    call needed at its peak. The caching allocator usually *reserves* more than is
+    allocated; that is torch.cuda.memory_reserved, not reported.
     """
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
@@ -123,6 +146,60 @@ def peak_memory_cuda(fn) -> dict:
     return {"baseline_allocated_bytes": baseline, "peak_allocated_bytes": peak, "incremental_peak_bytes": peak - baseline}
 
 
+def profile_call(fn) -> tuple[list[str], int]:
+    """Run fn once under torch.profiler. Returns (aten ops in call order, CPU incremental peak bytes).
+
+    Peak: every allocation (+bytes) and free (-bytes) is a raw "[memory]" record with its own
+    timestamp. Summing them in time order gives live bytes; the max is the peak above the
+    bytes alive before the call. Only PyTorch-allocator memory is seen.
+
+    Per-op totals (FunctionEvent.self_cpu_memory_usage) are NOT usable for this: a free
+    inside an op (e.g. SDPA's math kernel releasing its [L, L] buffer) is charged to the
+    op as a whole, losing *when* it happened, and hid that kernel's peak in an earlier
+    version. `prof.profiler.kineto_results` is not a documented API (checked on torch 2.14.1);
+    test_benchmark.py guards it.
+    """
+    with profile(activities=[ProfilerActivity.CPU], profile_memory=True) as prof:
+        out = fn()
+        del out
+    records = sorted((e.start_ns(), e.nbytes()) for e in prof.profiler.kineto_results.events() if e.name() == "[memory]")
+    live = peak = 0
+    for _, nbytes in records:
+        live += nbytes
+        peak = max(peak, live)
+    events = sorted(prof.events(), key=lambda e: e.time_range.start)
+    return list(dict.fromkeys(e.name for e in events if e.name.startswith("aten::"))), peak
+
+
+def measure_method(fn, golden, tol, device, opts) -> dict:
+    out = fn().double()
+    max_err = (out - golden).abs().max().item()
+    correct = torch.allclose(out, golden, **tol)
+    del out
+
+    ops, cpu_peak = profile_call(fn)
+    if device.type == "cuda":
+        samples, per = time_cuda(fn, opts.warmup, opts.cuda_reps)
+        memory = peak_memory_cuda(fn)
+    else:
+        samples, per = time_cpu(fn, opts.warmup, opts.min_run_time, opts.threads)
+        memory = {"incremental_peak_bytes": cpu_peak}
+    return {
+        "status": "ok",
+        "skip_reason": None,
+        "max_abs_err": max_err,
+        "correct": correct,
+        # Which SDPA kernel actually ran, as seen by the profiler (empty for our own methods).
+        "observed_sdpa_ops": [o for o in ops if o.startswith("aten::_scaled_dot_product")],
+        "timing": {**summarize(samples), "calls_per_sample": per, "warmup_calls": opts.warmup, "samples_s": samples},
+        "memory": memory,
+    }
+
+
+def _reason(e: Exception) -> str:
+    return f"{type(e).__name__}: {(str(e).splitlines() or [''])[0]}"
+
+
 def run_config(device, dtype_name, batch, heads, seq_len, head_dim, causal, opts) -> dict:
     rec = dict(
         dtype=dtype_name, batch=batch, heads=heads, seq_len=seq_len, head_dim=head_dim, causal=causal,
@@ -132,42 +209,46 @@ def run_config(device, dtype_name, batch, heads, seq_len, head_dim, causal, opts
     if device.type == "cuda" and dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported(including_emulation=False):
         return {**rec, "status": "skipped", "skip_reason": "bfloat16 not natively supported on this GPU"}
 
+    tol = TOLERANCES[dtype_name]
     try:
         # Same seed -> same values on every device: generate on CPU in float32, then move/cast.
         g = torch.Generator().manual_seed(opts.seed)
         q, k, v = (torch.randn(batch, heads, seq_len, head_dim, generator=g).to(device, dtype) for _ in range(3))
-
-        # inference_mode: no autograd graph is recorded (faster than no_grad, and
-        # the outputs can never be used in backward).
+        # inference_mode: no autograd graph is recorded, and outputs can never be used in backward.
         with torch.inference_mode():
             golden = reference_attention(q.double(), k.double(), v.double(), causal=causal)
-            tol = TOLERANCES[dtype_name]
-            correctness = {"golden": "reference_attention in float64 on same inputs", **tol, "max_abs_err": {}}
-            passed = True
-            for name, method in METHODS.items():
-                out = method(q, k, v, causal=causal).double()
-                correctness["max_abs_err"][name] = (out - golden).abs().max().item()
-                passed &= torch.allclose(out, golden, **tol)
-            correctness["passed"] = passed
-            del golden, out
-
-            methods = {}
-            for name, method in METHODS.items():
-                fn = partial(method, q, k, v, causal=causal)
-                if device.type == "cuda":
-                    samples, per = time_cuda(fn, opts.warmup, opts.cuda_reps)
-                else:
-                    samples, per = time_cpu(fn, opts.warmup, opts.min_run_time, opts.threads)
-                timing = {**summarize(samples), "calls_per_sample": per, "warmup_calls": opts.warmup, "samples_s": samples}
-                memory = peak_memory_cuda(fn) if device.type == "cuda" else None  # no allocator stats on CPU
-                methods[name] = {"timing": timing, "memory": memory}
-    except RuntimeError as e:  # includes torch.OutOfMemoryError and "not implemented for <dtype>"
+    except RuntimeError as e:  # includes torch.OutOfMemoryError
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        return {**rec, "status": "skipped", "skip_reason": f"{type(e).__name__}: {str(e).splitlines()[0]}"}
+        return {**rec, "status": "skipped", "skip_reason": _reason(e)}
 
-    ratio = speedup(methods["reference"]["timing"]["median_s"], methods["sdpa"]["timing"]["median_s"])
-    return {**rec, "correctness": correctness, "methods": methods, "speedup_reference_over_sdpa": ratio}
+    methods = {}
+    with torch.inference_mode():
+        for name in opts.methods:
+            kwargs = {"block_size": opts.block_size} if name == "tiled" else {}
+            fn = partial(METHODS[name], q, k, v, causal=causal, **kwargs)
+            try:
+                methods[name] = measure_method(fn, golden, tol, device, opts)
+            except RuntimeError as e:  # a forced backend that can't run this input, OOM, unsupported dtype
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                methods[name] = {"status": "skipped", "skip_reason": _reason(e)}
+    del golden
+
+    ok = {n: m for n, m in methods.items() if m["status"] == "ok"}
+    ref = ok.get("reference")
+    speedups = (
+        {n: speedup(ref["timing"]["median_s"], m["timing"]["median_s"]) for n, m in ok.items() if n != "reference"}
+        if ref
+        else {}
+    )
+    return {
+        **rec,
+        "golden": "reference_attention in float64 on the same inputs",
+        "tolerance": tol,
+        "methods": methods,
+        "speedup_vs_reference": speedups,
+    }
 
 
 def resolve_device(name: str) -> torch.device:
@@ -209,11 +290,13 @@ def write_csv(path: Path, env: dict, results: list[dict]) -> None:
                 w.writerow(base)
                 continue
             for name, m in r["methods"].items():
-                row = {**base, "method": name, **{k: v for k, v in m["timing"].items() if k != "samples_s"}}
-                row["max_abs_err"] = r["correctness"]["max_abs_err"][name]
-                row["correct"] = r["correctness"]["passed"]
-                row["speedup_reference_over_sdpa"] = r["speedup_reference_over_sdpa"]
-                row.update(m["memory"] or {})
+                row = {**base, "method": name, "status": m["status"], "skip_reason": m["skip_reason"]}
+                if m["status"] == "ok":
+                    row.update({k: v for k, v in m["timing"].items() if k != "samples_s"})
+                    row.update(max_abs_err=m["max_abs_err"], correct=m["correct"])
+                    row["speedup_vs_reference"] = r["speedup_vs_reference"].get(name)
+                    row["incremental_peak_bytes"] = m["memory"]["incremental_peak_bytes"]
+                    row["observed_sdpa_ops"] = " ".join(m["observed_sdpa_ops"])
                 w.writerow(row)
 
 
@@ -222,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m attention_lab.benchmark", description=__doc__.split("\n\n")[0])
     p.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
     p.add_argument("--preset", choices=PRESETS, default="smoke")
+    p.add_argument("--methods", nargs="+", choices=METHODS, default=DEFAULT_METHODS, help="must include reference")
+    p.add_argument("--block-size", type=int, default=64, help="key block size for the tiled method")
     p.add_argument("--batch", type=int, help="override preset")
     p.add_argument("--heads", type=int, help="override preset")
     p.add_argument("--head-dim", type=int, help="override preset")
@@ -230,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--causal", choices=["both", "on", "off"], default="both")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--warmup", type=int, default=10, help="untimed calls per method before measuring")
-    p.add_argument("--min-run-time", type=float, default=0.2, help="CPU: seconds of measurement per method")
+    p.add_argument("--min-run-time", type=float, help="CPU: seconds of measurement per method (default: preset or 0.2)")
     p.add_argument("--cuda-reps", type=int, default=50, help="CUDA: measured calls per method")
     p.add_argument("--threads", type=int, help="CPU threads (default: torch.get_num_threads())")
     p.add_argument("--output", type=Path, default=Path("results/run.json"))
@@ -239,6 +324,10 @@ def main(argv: list[str] | None = None) -> int:
     device = resolve_device(opts.device)
     if opts.preset == "cuda-sweep" and device.type != "cuda":
         p.error("--preset cuda-sweep requires a CUDA device")
+    if "reference" not in opts.methods:
+        p.error("--methods must include reference (the baseline for speedups)")
+    if opts.block_size < 1:
+        p.error("--block-size must be >= 1")
     if opts.threads:
         torch.set_num_threads(opts.threads)
     opts.threads = torch.get_num_threads()
@@ -247,6 +336,8 @@ def main(argv: list[str] | None = None) -> int:
     for key in ("batch", "heads", "head_dim", "seq_lens", "dtypes"):
         if getattr(opts, key) is not None:
             cfg[key] = getattr(opts, key)
+    opts.min_run_time = opts.min_run_time or cfg.pop("min_run_time", 0.2)
+    cfg.pop("min_run_time", None)
     causal_flags = {"both": [False, True], "on": [True], "off": [False]}[opts.causal]
 
     env = environment(device)
@@ -255,6 +346,8 @@ def main(argv: list[str] | None = None) -> int:
         "preset": opts.preset,
         **cfg,
         "causal": causal_flags,
+        "methods": opts.methods,
+        "tiled_block_size": opts.block_size,
         "seed": opts.seed,
         "warmup_calls": opts.warmup,
         "timing_method": (
@@ -267,13 +360,14 @@ def main(argv: list[str] | None = None) -> int:
         "memory_method": (
             "torch.cuda.reset_peak_memory_stats + max_memory_allocated per method (allocated, not reserved)"
             if device.type == "cuda"
-            else "unavailable on CPU"
+            else "torch.profiler(profile_memory=True): peak of live CPU-allocator bytes during one call, "
+            "above the bytes alive before it"
         ),
-        "sdpa_backend": "automatic selection; not verified",
+        "sdpa_backend": "automatic selection; the kernel that ran is recorded per method as observed_sdpa_ops",
         "tolerances": {d: TOLERANCES[d] for d in cfg["dtypes"]},
     }
 
-    print(f"device={device} torch={torch.__version__} threads={opts.threads} preset={opts.preset}")
+    print(f"device={device} torch={torch.__version__} threads={opts.threads} preset={opts.preset} methods={opts.methods}")
     results = []
     for seq_len in cfg["seq_lens"]:
         for dtype_name in cfg["dtypes"]:
@@ -284,12 +378,17 @@ def main(argv: list[str] | None = None) -> int:
                 if r["status"] != "ok":
                     print(f"{tag} SKIPPED: {r['skip_reason']}")
                     continue
-                ref, sd = (r["methods"][m]["timing"] for m in ("reference", "sdpa"))
-                print(
-                    f"{tag} reference {ref['median_s'] * 1e6:9.1f} us (IQR {ref['iqr_s'] * 1e6:6.1f})  "
-                    f"sdpa {sd['median_s'] * 1e6:9.1f} us (IQR {sd['iqr_s'] * 1e6:6.1f})  "
-                    f"ref/sdpa {r['speedup_reference_over_sdpa']:.2f}x  correct={r['correctness']['passed']}"
-                )
+                for name, m in r["methods"].items():
+                    if m["status"] != "ok":
+                        print(f"{tag} {name:<14} SKIPPED: {m['skip_reason']}")
+                        continue
+                    t = m["timing"]
+                    ratio = r["speedup_vs_reference"].get(name)
+                    print(
+                        f"{tag} {name:<14} {t['median_s'] * 1e6:10.1f} us (IQR {t['iqr_s'] * 1e6:7.1f})"
+                        f"  peak {m['memory']['incremental_peak_bytes'] / 2**20:8.2f} MiB"
+                        f"  {'ref/this ' + format(ratio, '.2f') + 'x' if ratio else '':<15} correct={m['correct']}"
+                    )
 
     opts.output.parent.mkdir(parents=True, exist_ok=True)
     opts.output.write_text(json.dumps({"environment": env, "settings": settings, "results": results}, indent=2))
@@ -297,9 +396,13 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(csv_path, env, results)
     print(f"wrote {opts.output} and {csv_path}")
 
-    failed = [r for r in results if r["status"] == "ok" and not r["correctness"]["passed"]]
+    failed = [
+        (r["seq_len"], r["causal"], n)
+        for r in results if r["status"] == "ok"
+        for n, m in r["methods"].items() if m["status"] == "ok" and not m["correct"]
+    ]  # fmt: skip
     if failed:
-        print(f"WARNING: {len(failed)} configuration(s) failed correctness; timings recorded but suspect.")
+        print(f"WARNING: correctness failed for {failed}; timings recorded but suspect.")
     return 1 if failed else 0
 
 

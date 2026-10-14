@@ -18,8 +18,10 @@ def test_report_from_real_smoke_run(tmp_path):
     report.main([str(run), "--out-dir", str(tmp_path / "rep")])
 
     text = (tmp_path / "rep" / "report.md").read_text()
-    assert "automatic selection; not verified" in text
-    assert "| 32 | float32 | noncausal |" in text and "| 32 | float32 | causal |" in text
+    assert "automatic selection" in text
+    for method in ("reference", "sdpa", "tiled"):
+        assert f"| 32 | float32 | noncausal | {method} |" in text and f"| 32 | float32 | causal | {method} |" in text
+    assert "_scaled_dot_product" in text  # the SDPA kernel the profiler observed
     assert "python -m attention_lab.benchmark --preset smoke" in text
-    assert (tmp_path / "rep" / "smoke-latency.png").stat().st_size > 0
-    assert not (tmp_path / "rep" / "smoke-memory.png").exists()  # CPU: no memory plot
+    for kind in ("latency", "memory"):
+        assert (tmp_path / "rep" / f"smoke-{kind}.png").stat().st_size > 0

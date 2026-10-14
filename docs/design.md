@@ -10,7 +10,8 @@ attention.py ──► benchmark.py ──► results/*.json, *.csv ──► re
 tests/test_attention.py
 ```
 
-- `attention.py` holds the math: `validate_qkv`, `causal_mask`, `reference_attention`, and `sdpa_attention`.
+- `attention.py` holds the math: `validate_qkv`, `causal_mask`, `reference_attention`, `tiled_attention`
+  and `sdpa_attention`.
 - `benchmark.py` imports both attention functions and treats them as black boxes with one signature:
   `fn(q, k, v, causal=bool) -> Tensor`.
 - `report.py` reads only JSON files. It never calls the attention code, so it cannot make up numbers.
@@ -54,6 +55,43 @@ The test `test_causal_ignores_future_tokens` changes q, k and v at positions ≥
 outputs before t stay the same. It also asserts that *without* the mask they change, which shows the
 test would catch a missing mask.
 
+## Tiled attention (online softmax)
+
+`tiled_attention(q, k, v, causal, block_size=64)` computes the same result as the reference without
+ever building the [L, L] matrix. It loops over key blocks and processes all queries at once.
+
+For each query row it keeps three running values:
+- `m` [B, H, L, 1]: the largest score seen so far
+- `l` [B, H, L, 1]: Σ exp(s − m)
+- `acc` [B, H, L, D]: Σ exp(s − m)·v
+
+For each block of scores `s` [B, H, L, bs]:
+
+```
+m_new = max(m, rowmax(s));  alpha = exp(m - m_new);  p = exp(s - m_new)
+l   = alpha * l   + rowsum(p)
+acc = alpha * acc + p @ v_block
+```
+
+The output is `acc / l`. `alpha` rewrites the old sums relative to the new max. That's why the result is
+exact, not an approximation. Worked example: scores [0, ln 3 | ln 6] with v = [2, 4 | 6] gives 5 both
+ways. Block 2 raises the max, so alpha = 1/2. This case is tested (`test_tiled_rescales_when_max_rises`).
+
+**Causal masking per block:** key position > query position is set to −inf. Blocks run in order from
+key 0, and every row may see key 0, so `m` is finite after the first block. A later fully masked block
+then gives exp(−inf − m) = 0, never the NaN of exp(−inf − (−inf)).
+
+**Memory:** the temporaries are [B, H, L, bs] and [B, H, L, D], so the peak grows as L·(bs + D) instead of L².
+Measured: 9.2 MiB vs the reference's 257 MiB at L = 4096. `test_cpu_peak_memory_scaling` checks the
+growth rates.
+
+**Limits, deliberately:**
+- Only keys are tiled. Tiling queries as well would let the causal case skip blocks above the diagonal,
+  which is about half the work. The code has a `ponytail:` comment marking this.
+- It's a Python loop of about 20 small ops per block, so it's slow at small L.
+- Under autograd every block's `p` is saved, so *training* memory is O(L²) again. FlashAttention avoids
+  that by recomputing blocks in the backward pass. The project is inference-only.
+
 ## Autograd vs inference
 
 - **Training/autograd:** PyTorch records each operation in a graph so that `backward()` (or
@@ -86,4 +124,5 @@ shape/device problems and `TypeError` for type problems.
 ## Limitations
 
 There is no GQA, padding mask, dropout, KV cache, rectangular causal attention, or MPS/other
-accelerator support. The benchmark measures one isolated attention call, not a model.
+accelerator support. The tiled method is the algorithm in Python, not a fused kernel. The benchmark
+measures one isolated attention call, not a model.

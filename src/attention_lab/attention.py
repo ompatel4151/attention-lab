@@ -77,6 +77,55 @@ def reference_attention(
     return weights @ v
 
 
+def tiled_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, block_size: int = 64
+) -> torch.Tensor:
+    """Online-softmax attention (the FlashAttention recurrence) over key blocks.
+
+    Never materialises the [L, L] score matrix; the largest temporaries are
+    [B, H, L, block_size]. For every query row it keeps
+        m   = running max of the scores seen so far       [B, H, L, 1]
+        l   = running sum of exp(score - m)               [B, H, L, 1]
+        acc = running sum of exp(score - m) * v_j         [B, H, L, D]
+    When a block raises the max, the old l and acc are rescaled by
+    exp(m_old - m_new), which rewrites them relative to the new max.
+    At the end acc / l == softmax(scores) @ v exactly, up to float rounding.
+
+    Inference-oriented: under autograd every block's weights are saved for
+    backward, so training memory is O(L^2) again. FlashAttention avoids that by
+    recomputing blocks in backward.
+    """
+    validate_qkv(q, k, v)
+    if not isinstance(block_size, int) or block_size < 1:
+        raise ValueError(f"block_size must be a positive int, got {block_size!r}")
+    seq_len, d = q.size(-2), q.size(-1)
+
+    m = torch.full((*q.shape[:-1], 1), float("-inf"), dtype=q.dtype, device=q.device)
+    l = torch.zeros_like(m)
+    acc = torch.zeros_like(q)
+    query_pos = torch.arange(seq_len, device=q.device).unsqueeze(-1)  # [L, 1]
+
+    # ponytail: tiles keys only, all queries at once. Tiling queries too would let causal
+    # skip blocks above the diagonal (about half the work); add if causal speed matters.
+    for start in range(0, seq_len, block_size):
+        k_b = k[..., start : start + block_size, :]  # [B, H, bs, D]; the last block may be shorter
+        v_b = v[..., start : start + block_size, :]
+        s = (q @ k_b.transpose(-2, -1)) / math.sqrt(d)  # [B, H, L, bs]
+        if causal:
+            key_pos = torch.arange(start, start + k_b.size(-2), device=q.device)  # [bs]
+            # [L, bs] mask, True = future key = blocked. Blocks go in order from key 0 and
+            # every row may see key 0, so m is finite after the first block: a later
+            # all-masked block gives exp(-inf - m) = 0, never exp(-inf - -inf) = NaN.
+            s = s.masked_fill(key_pos > query_pos, float("-inf"))
+        m_new = torch.maximum(m, s.amax(dim=-1, keepdim=True))
+        alpha = torch.exp(m - m_new)  # rescale factor for the old sums (0 on the first block)
+        p = torch.exp(s - m_new)  # this block's unnormalised weights, each <= 1
+        l = alpha * l + p.sum(dim=-1, keepdim=True)
+        acc = alpha * acc + p @ v_b
+        m = m_new
+    return acc / l
+
+
 def sdpa_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False
 ) -> torch.Tensor:

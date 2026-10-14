@@ -18,11 +18,11 @@ difference and where it occurred.
 import pytest
 import torch
 
-from attention_lab import causal_mask, reference_attention, sdpa_attention
+from attention_lab import causal_mask, reference_attention, sdpa_attention, tiled_attention
 
 FWD_TOL = dict(atol=1e-5, rtol=1e-5)
 GRAD_TOL = dict(atol=5e-5, rtol=1e-4)
-BOTH = [reference_attention, sdpa_attention]
+ALL_METHODS = [reference_attention, sdpa_attention, tiled_attention]
 
 
 def make_qkv(shape, seed=0):
@@ -36,7 +36,7 @@ def test_causal_mask_layout():
     assert torch.equal(causal_mask(3), expected)
 
 
-@pytest.mark.parametrize("fn", BOTH)
+@pytest.mark.parametrize("fn", ALL_METHODS)
 def test_hand_checkable_example(fn):
     # B=H=1, L=2, D=1 so the scale 1/sqrt(D) is 1.
     # q0 = ln 3, k = [1, 0] -> row-0 scores [ln 3, 0] -> softmax [3/4, 1/4].
@@ -62,7 +62,7 @@ def test_reference_matches_sdpa(shape, causal):
     torch.testing.assert_close(out, ref, **FWD_TOL)
 
 
-@pytest.mark.parametrize("fn", BOTH)
+@pytest.mark.parametrize("fn", ALL_METHODS)
 def test_causal_ignores_future_tokens(fn):
     L, t = 8, 5
     q, k, v = make_qkv((1, 2, L, 4))
@@ -83,7 +83,7 @@ def test_causal_ignores_future_tokens(fn):
 _good = torch.randn(1, 1, 4, 8)
 
 
-@pytest.mark.parametrize("fn", BOTH)
+@pytest.mark.parametrize("fn", ALL_METHODS)
 @pytest.mark.parametrize(
     "q, k, v, err",
     [
@@ -116,5 +116,36 @@ def test_gradients_match_sdpa(causal):
         # Vector-Jacobian product: returns (dL/dq, dL/dk, dL/dv) for L = sum(out * grad_out).
         return torch.autograd.grad(out, inputs, grad_outputs=grad_out)
 
-    for name, g_ref, g_sdpa in zip("qkv", grads(reference_attention), grads(sdpa_attention)):
-        torch.testing.assert_close(g_sdpa, g_ref, **GRAD_TOL, msg=lambda m: f"d{name}: {m}")
+    g_sdpa = grads(sdpa_attention)
+    for method in (reference_attention, tiled_attention):
+        for name, g, g_s in zip("qkv", grads(method), g_sdpa):
+            torch.testing.assert_close(g, g_s, **GRAD_TOL, msg=lambda m: f"{method.__name__} d{name}: {m}")
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("block_size", [1, 7, "L", 1000])  # 7 does not divide L; "L" = one block; 1000 > L
+@pytest.mark.parametrize("shape", [(1, 2, 32, 32), (2, 3, 17, 8), (1, 1, 1, 4)])
+def test_tiled_matches_reference(shape, block_size, causal):
+    q, k, v = make_qkv(shape)
+    bs = shape[2] if block_size == "L" else block_size
+    out = tiled_attention(q, k, v, causal=causal, block_size=bs)
+    assert out.shape == shape
+    torch.testing.assert_close(out, reference_attention(q, k, v, causal=causal), **FWD_TOL)
+
+
+def test_tiled_rescales_when_max_rises():
+    # One row, scores [0, ln 3 | ln 6] with block_size=2: block 2 raises the running max,
+    # so the old sums must be rescaled by exp(ln 3 - ln 6) = 1/2. Exact answer:
+    # softmax weights [1, 3, 6] / 10 over v = [2, 4, 6] -> 5.0.
+    # D=1 and q=1, so row 0's scores are exactly k. Only row 0 is checked.
+    q = torch.ones(1, 1, 3, 1)
+    k = torch.log(torch.tensor([1.0, 3.0, 6.0])).view(1, 1, 3, 1)
+    v = torch.tensor([2.0, 4.0, 6.0]).view(1, 1, 3, 1)
+    torch.testing.assert_close(tiled_attention(q, k, v, block_size=2)[0, 0, 0], torch.tensor([5.0]))
+
+
+@pytest.mark.parametrize("block_size", [0, -1, 2.5])
+def test_tiled_rejects_bad_block_size(block_size):
+    q, k, v = make_qkv((1, 1, 4, 8))
+    with pytest.raises(ValueError):
+        tiled_attention(q, k, v, block_size=block_size)
